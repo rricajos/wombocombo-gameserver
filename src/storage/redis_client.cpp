@@ -13,6 +13,12 @@ RedisClient::~RedisClient() {
 }
 
 bool RedisClient::connect(const std::string& host, int port, const std::string& password) {
+    // Clean up previous connection if any
+    if (ctx_) {
+        redisFree(static_cast<redisContext*>(ctx_));
+        ctx_ = nullptr;
+    }
+
     auto* c = redisConnect(host.c_str(), port);
     if (!c) {
         logger::error("redis: failed to allocate context");
@@ -29,7 +35,7 @@ bool RedisClient::connect(const std::string& host, int port, const std::string& 
         auto* reply = static_cast<redisReply*>(
             redisCommand(c, "AUTH %s", password.c_str()));
         if (!reply || reply->type == REDIS_REPLY_ERROR) {
-            logger::error("redis: auth failed: " +
+            logger::warn("redis: auth failed: " +
                 (reply ? std::string(reply->str) : "no reply"));
             if (reply) freeReplyObject(reply);
             redisFree(c);
@@ -49,7 +55,8 @@ bool RedisClient::connect(const std::string& host, int port, const std::string& 
     freeReplyObject(reply);
 
     ctx_ = c;
-    logger::info("redis: connected to " + host + ":" + std::to_string(port));
+    logger::info("redis: connected to " + host + ":" + std::to_string(port)
+                 + (password.empty() ? " (no auth)" : " (authenticated)"));
     return true;
 }
 

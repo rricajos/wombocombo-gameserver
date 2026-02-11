@@ -43,7 +43,20 @@ WebSocketServer::WebSocketServer(const config::ServerConfig& cfg)
     tick_dt_ = 1.0f / static_cast<float>(cfg.tick_rate);
 
     // Connect to Redis and fetch JWT secret
-    if (redis_.connect(cfg.redis_addr, cfg.redis_port, cfg.redis_password)) {
+    bool redis_connected = false;
+
+    // First try with password if provided
+    if (!cfg.redis_password.empty()) {
+        redis_connected = redis_.connect(cfg.redis_addr, cfg.redis_port, cfg.redis_password);
+        if (!redis_connected) {
+            logger::warn("Redis auth failed, retrying without password...");
+            redis_connected = redis_.connect(cfg.redis_addr, cfg.redis_port, "");
+        }
+    } else {
+        redis_connected = redis_.connect(cfg.redis_addr, cfg.redis_port, "");
+    }
+
+    if (redis_connected) {
         auto secret = redis_.get("jwt:secret");
         if (secret) {
             jwt_secret_ = *secret;
@@ -123,9 +136,20 @@ void WebSocketServer::setup_room_broadcast(game::Room* room) {
     room->set_broadcast_fn(
         [this](const std::string& pid, const std::string& message) {
             auto it = player_sockets_.find(pid);
-            if (it != player_sockets_.end()) {
-                auto* ws = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(it->second);
-                ws->send(message, uWS::OpCode::TEXT);
+            if (it == player_sockets_.end()) return;
+
+            auto* ws = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(it->second);
+
+            // Check backpressure before sending
+            auto bp = ws->getBufferedAmount();
+            if (bp > 128 * 1024) {
+                logger::warn("high backpressure for player " + pid + ": " + std::to_string(bp) + " bytes, dropping message");
+                return;  // Drop message instead of overwhelming the socket
+            }
+
+            auto status = ws->send(message, uWS::OpCode::TEXT);
+            if (status == uWS::WebSocket<false, true, PerSocketData>::DROPPED) {
+                logger::warn("message dropped for player " + pid + " (socket closing)");
             }
         }
     );
@@ -147,7 +171,7 @@ void WebSocketServer::run() {
             .compression = uWS::DISABLED,
             .maxPayloadLength = 16 * 1024,
             .idleTimeout = 120,
-            .maxBackpressure = 64 * 1024,
+            .maxBackpressure = 256 * 1024,  // Increased from 64KB to 256KB
 
             // ── Upgrade (HTTP → WS handshake) ────────────────
             .upgrade = [this](auto* res, auto* req, auto* context) {
@@ -184,7 +208,7 @@ void WebSocketServer::run() {
                     }
                     player_id = payload->sub;
                     player_name = payload->username;
-                    logger::debug("JWT validated for player " + player_id + " (" + player_name + ")");
+                    logger::info("JWT validated | player=" + player_id + " name=" + player_name);
                 } else {
                     // Dev mode fallback: generate random ID
                     player_id = generate_id();
@@ -201,7 +225,6 @@ void WebSocketServer::run() {
 
                 // Check if player is already in this room (reconnect scenario)
                 if (room->has_player(player_id)) {
-                    // Remove old connection, new one will replace it
                     auto sock_it = player_sockets_.find(player_id);
                     if (sock_it != player_sockets_.end()) {
                         auto* old_ws = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(sock_it->second);
@@ -297,6 +320,15 @@ void WebSocketServer::run() {
                 }
 
                 network::handle_message(*room, data->player_id, *parsed);
+            },
+
+            // ── Drain (backpressure relieved) ────────────────
+            .drain = [](auto* ws) {
+                auto bp = ws->getBufferedAmount();
+                if (bp > 0) {
+                    auto* data = ws->getUserData();
+                    logger::debug("drain | player=" + data->player_id + " remaining=" + std::to_string(bp));
+                }
             },
 
             // ── Connection closed ────────────────────────────
