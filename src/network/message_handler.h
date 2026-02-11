@@ -30,15 +30,6 @@ inline bool handle_message(game::Room& room,
     if (type == "player_ready") {
         bool ready = msg.value("ready", false);
         room.set_player_ready(player_id, ready);
-
-        // Check if all players are ready → signal game start (Phase 2+)
-        if (room.all_ready()) {
-            logger::info("all players ready in room " + room.id() + " — game start pending (Phase 2)");
-            room.broadcast({
-                {"type", "all_ready"},
-                {"message", "All players ready. Game will start soon."}
-            });
-        }
         return true;
     }
 
@@ -48,7 +39,6 @@ inline bool handle_message(game::Room& room,
             room.send_to(player_id, make_error(400, "Empty chat message"));
             return false;
         }
-        // Cap message length
         if (message.size() > 200) {
             message = message.substr(0, 200);
         }
@@ -56,24 +46,36 @@ inline bool handle_message(game::Room& room,
         return true;
     }
 
-    // ── Gameplay messages (Phase 2+) ──────────────
+    // ── Gameplay messages ─────────────────────────
     if (type == "player_input") {
-        // Will be implemented in Phase 2
-        logger::debug("received player_input from " + player_id + " (ignored in Phase 1)");
+        int tick = msg.value("tick", 0);
+
+        std::vector<std::string> actions;
+        if (msg.contains("actions") && msg["actions"].is_array()) {
+            for (const auto& a : msg["actions"]) {
+                if (a.is_string()) {
+                    actions.push_back(a.get<std::string>());
+                }
+            }
+        }
+
+        room.queue_input(player_id, tick, actions);
         return true;
     }
 
     if (type == "player_action") {
-        logger::debug("received player_action from " + player_id + " (ignored in Phase 1)");
+        // Phase 3+: use_item, etc.
+        logger::debug("received player_action from " + player_id + " (Phase 3)");
         return true;
     }
 
     if (type == "buy_item") {
-        logger::debug("received buy_item from " + player_id + " (ignored in Phase 1)");
+        // Phase 4: shop system
+        logger::debug("received buy_item from " + player_id + " (Phase 4)");
         return true;
     }
 
-    // Unknown message type
+    // Unknown message type — log but don't spam the client
     logger::warn("unknown message type '" + type + "' from player " + player_id);
     room.send_to(player_id, make_error(400, "Unknown message type: " + type));
     return false;

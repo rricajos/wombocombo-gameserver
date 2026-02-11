@@ -1,18 +1,30 @@
 #include "server/websocket_server.h"
+#include "server/jwt.h"
 #include "network/protocol.h"
 #include "network/message_handler.h"
 #include "utils/logger.h"
 
 #include <App.h>  // uWebSockets main header
 
+// uSockets timer API for the game loop
+extern "C" {
+    struct us_timer_t;
+    struct us_loop_t;
+    struct us_timer_t *us_create_timer(struct us_loop_t *loop, int fallthrough, unsigned int ext_size);
+    void us_timer_set(struct us_timer_t *timer, void (*cb)(struct us_timer_t *), int ms, int repeat_ms);
+    void us_timer_close(struct us_timer_t *timer);
+    void *us_timer_ext(struct us_timer_t *timer);
+}
+
 #include <string>
 #include <sstream>
 #include <random>
 #include <algorithm>
+#include <cstring>
 
 namespace server {
 
-// Generate a simple random ID (Phase 1 only — JWT-based in Phase 2)
+// Fallback ID generator (used if JWT validation is disabled)
 static std::string generate_id(int len = 8) {
     static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
     static thread_local std::mt19937 rng{std::random_device{}()};
@@ -27,7 +39,22 @@ static std::string generate_id(int len = 8) {
 }
 
 WebSocketServer::WebSocketServer(const config::ServerConfig& cfg)
-    : cfg_(cfg) {}
+    : cfg_(cfg) {
+    tick_dt_ = 1.0f / static_cast<float>(cfg.tick_rate);
+
+    // Connect to Redis and fetch JWT secret
+    if (redis_.connect(cfg.redis_addr, cfg.redis_port, cfg.redis_password)) {
+        auto secret = redis_.get("jwt:secret");
+        if (secret) {
+            jwt_secret_ = *secret;
+            logger::info("JWT secret loaded from Redis (" + std::to_string(jwt_secret_.size()) + " bytes)");
+        } else {
+            logger::warn("jwt:secret not found in Redis — JWT validation disabled");
+        }
+    } else {
+        logger::warn("Redis not available — JWT validation disabled, running in dev mode");
+    }
+}
 
 std::unordered_map<std::string, std::string> WebSocketServer::parse_query(std::string_view url) {
     std::unordered_map<std::string, std::string> params;
@@ -64,7 +91,7 @@ game::Room* WebSocketServer::get_or_create_room(const std::string& room_id) {
     }
 
     if (static_cast<int>(rooms_.size()) >= cfg_.max_rooms) {
-        logger::warn("max rooms reached (" + std::to_string(cfg_.max_rooms) + "), rejecting room creation");
+        logger::warn("max rooms reached (" + std::to_string(cfg_.max_rooms) + "), rejecting");
         return nullptr;
     }
 
@@ -92,16 +119,34 @@ void WebSocketServer::cleanup_empty_rooms() {
     }
 }
 
-void WebSocketServer::run() {
-    // uWS is single-threaded — everything runs on this event loop.
-    // That means no locks needed for rooms_ or player_sockets_.
+void WebSocketServer::setup_room_broadcast(game::Room* room) {
+    room->set_broadcast_fn(
+        [this](const std::string& pid, const std::string& message) {
+            auto it = player_sockets_.find(pid);
+            if (it != player_sockets_.end()) {
+                auto* ws = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(it->second);
+                ws->send(message, uWS::OpCode::TEXT);
+            }
+        }
+    );
+}
 
+void WebSocketServer::tick() {
+    tick_count_++;
+
+    for (auto& [id, room] : rooms_) {
+        if (room->state() == game::RoomState::PLAYING) {
+            room->update(tick_dt_);
+        }
+    }
+}
+
+void WebSocketServer::run() {
     uWS::App()
         .ws<PerSocketData>("/ws/*", {
-            // Settings
             .compression = uWS::DISABLED,
-            .maxPayloadLength = 16 * 1024,  // 16 KB — plenty for JSON messages
-            .idleTimeout = 120,             // 2 min without pong → disconnect
+            .maxPayloadLength = 16 * 1024,
+            .idleTimeout = 120,
             .maxBackpressure = 64 * 1024,
 
             // ── Upgrade (HTTP → WS handshake) ────────────────
@@ -114,45 +159,73 @@ void WebSocketServer::run() {
                 // Extract room code from path: /ws/{roomCode}
                 std::string room_id;
                 if (url.rfind("/ws/", 0) == 0 && url.size() > 4) {
-                    room_id = url.substr(4);  // strip "/ws/"
+                    room_id = url.substr(4);
                 }
 
                 std::string token = params.count("token") ? params["token"] : "";
-                std::string name = params.count("name") ? params["name"] : "Player";
 
-                // Validate room_id is present
+                // Validate room_id
                 if (room_id.empty()) {
                     res->writeStatus("400 Bad Request")
-                       ->end("Missing 'room' query parameter");
+                       ->end("Missing room code in path");
                     return;
                 }
 
-                // Phase 1: generate a player ID (Phase 2 will extract from JWT)
-                std::string player_id = generate_id();
+                // ── JWT validation ──────────────────────────
+                std::string player_id;
+                std::string player_name = "Player";
 
-                // Check room availability before upgrading
+                if (!jwt_secret_.empty() && !token.empty()) {
+                    auto payload = auth::validate_jwt(token, jwt_secret_);
+                    if (!payload) {
+                        res->writeStatus("401 Unauthorized")
+                           ->end("Invalid or expired token");
+                        return;
+                    }
+                    player_id = payload->sub;
+                    player_name = payload->username;
+                    logger::debug("JWT validated for player " + player_id + " (" + player_name + ")");
+                } else {
+                    // Dev mode fallback: generate random ID
+                    player_id = generate_id();
+                    logger::debug("no JWT — generated player_id " + player_id);
+                }
+
+                // Check room availability
                 auto* room = get_or_create_room(room_id);
                 if (!room) {
                     res->writeStatus("503 Service Unavailable")
                        ->end("Server at max room capacity");
                     return;
                 }
+
+                // Check if player is already in this room (reconnect scenario)
+                if (room->has_player(player_id)) {
+                    // Remove old connection, new one will replace it
+                    auto sock_it = player_sockets_.find(player_id);
+                    if (sock_it != player_sockets_.end()) {
+                        auto* old_ws = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(sock_it->second);
+                        old_ws->getUserData()->player_id = "";  // prevent double-remove
+                        old_ws->close();
+                    }
+                    room->remove_player(player_id);
+                }
+
                 if (room->is_full()) {
                     res->writeStatus("403 Forbidden")
                        ->end("Room is full");
                     return;
                 }
-                if (room->state() != game::RoomState::WAITING) {
+                if (room->state() == game::RoomState::FINISHED) {
                     res->writeStatus("403 Forbidden")
-                       ->end("Room is already in game");
+                       ->end("Room is finished");
                     return;
                 }
 
-                // Accept the upgrade — fill in per-socket data
                 res->template upgrade<PerSocketData>(
                     {
                         .player_id = player_id,
-                        .player_name = name,
+                        .player_name = player_name,
                         .room_id = room_id
                     },
                     req->getHeader("sec-websocket-key"),
@@ -169,7 +242,6 @@ void WebSocketServer::run() {
                              + " name=" + data->player_name
                              + " room=" + data->room_id);
 
-                // Store socket reference
                 player_sockets_[data->player_id] = ws;
 
                 auto* room = get_room(data->room_id);
@@ -180,19 +252,8 @@ void WebSocketServer::run() {
                     return;
                 }
 
-                // Set up the broadcast function so the room can send
-                // messages through player sockets
-                room->set_broadcast_fn(
-                    [this](const std::string& pid, const std::string& message) {
-                        auto it = player_sockets_.find(pid);
-                        if (it != player_sockets_.end()) {
-                            auto* target = static_cast<uWS::WebSocket<false, true, PerSocketData>*>(it->second);
-                            target->send(message, uWS::OpCode::TEXT);
-                        }
-                    }
-                );
+                setup_room_broadcast(room);
 
-                // Add player to room
                 game::Player player;
                 player.id = data->player_id;
                 player.name = data->player_name;
@@ -207,13 +268,13 @@ void WebSocketServer::run() {
 
                 // Send "connected" to the new player
                 room->send_to(data->player_id,
-                              network::make_connected(data->player_id, 0));
+                              network::make_connected(data->player_id, room->current_tick()));
 
-                // Notify others that a new player joined
+                // Notify others
                 room->broadcast_except(data->player_id,
                     network::make_player_joined(data->player_id, data->player_name));
 
-                // Send full lobby state to everyone
+                // Send lobby state to everyone
                 room->broadcast(room->lobby_state());
             },
 
@@ -239,48 +300,51 @@ void WebSocketServer::run() {
             },
 
             // ── Connection closed ────────────────────────────
-            .close = [this](auto* ws, int code, std::string_view reason) {
+            .close = [this](auto* ws, int code, std::string_view /*reason*/) {
                 auto* data = ws->getUserData();
+
+                // Skip if already cleaned up (reconnect scenario)
+                if (data->player_id.empty()) return;
+
                 logger::info("ws close | player=" + data->player_id
                              + " room=" + data->room_id
                              + " code=" + std::to_string(code));
 
-                // Remove socket reference
                 player_sockets_.erase(data->player_id);
 
                 auto* room = get_room(data->room_id);
                 if (room) {
                     room->remove_player(data->player_id);
-
-                    // Notify remaining players
                     room->broadcast(network::make_player_left(data->player_id));
 
-                    // Send updated lobby state
                     if (!room->is_empty()) {
                         room->broadcast(room->lobby_state());
                     }
                 }
 
-                // Periodically clean up finished rooms
                 cleanup_empty_rooms();
             }
         })
 
-        // ── Health check endpoint (for Docker / Traefik) ─────
+        // ── Health check ─────────────────────────────────
         .get("/health", [](auto* res, auto* /*req*/) {
             res->writeHeader("Content-Type", "application/json")
                ->end("{\"status\":\"ok\"}");
         })
 
-        // ── Server info endpoint ─────────────────────────────
+        // ── Server info ──────────────────────────────────
         .get("/info", [this](auto* res, auto* /*req*/) {
             int total_players = 0;
+            int playing_rooms = 0;
             for (const auto& [_, room] : rooms_) {
                 total_players += room->player_count();
+                if (room->state() == game::RoomState::PLAYING) playing_rooms++;
             }
             nlohmann::json info = {
                 {"rooms_active", rooms_.size()},
-                {"players_online", total_players}
+                {"rooms_playing", playing_rooms},
+                {"players_online", total_players},
+                {"tick", tick_count_}
             };
             res->writeHeader("Content-Type", "application/json")
                ->end(info.dump());
@@ -289,8 +353,23 @@ void WebSocketServer::run() {
         .listen(cfg_.port, [this](auto* listen_socket) {
             if (listen_socket) {
                 logger::info("game server listening on port " + std::to_string(cfg_.port));
-                logger::info("max_rooms=" + std::to_string(cfg_.max_rooms)
-                             + " max_players_per_room=" + std::to_string(cfg_.max_players_per_room));
+                logger::info("tick_rate=" + std::to_string(cfg_.tick_rate)
+                             + " tick_dt=" + std::to_string(tick_dt_) + "s"
+                             + " jwt=" + (jwt_secret_.empty() ? "disabled" : "enabled"));
+
+                // ── Start game loop timer ────────────────
+                int tick_ms = static_cast<int>(tick_dt_ * 1000.0f);
+                auto* timer = us_create_timer(
+                    (struct us_loop_t*) uWS::Loop::get(), 0, sizeof(WebSocketServer*));
+                WebSocketServer* self = this;
+                memcpy(us_timer_ext(timer), &self, sizeof(WebSocketServer*));
+                us_timer_set(timer, [](struct us_timer_t* t) {
+                    WebSocketServer* srv;
+                    memcpy(&srv, us_timer_ext(t), sizeof(WebSocketServer*));
+                    srv->tick();
+                }, tick_ms, tick_ms);
+
+                logger::info("game loop started at " + std::to_string(cfg_.tick_rate) + " ticks/s");
             } else {
                 logger::error("failed to listen on port " + std::to_string(cfg_.port));
             }

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(wombocombo-gameserver VERSION 0.1.0 LANGUAGES CXX C)
+project(wombocombo-gameserver VERSION 0.2.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,7 @@ endif()
 
 # ── Dependencies ─────────────────────────────────────
 
-# nlohmann/json (via vcpkg or FetchContent)
+# nlohmann/json
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
     include(FetchContent)
@@ -35,18 +35,34 @@ if(NOT nlohmann_json_FOUND)
     FetchContent_MakeAvailable(json)
 endif()
 
+# OpenSSL (for JWT HMAC-SHA256 verification)
+find_package(OpenSSL REQUIRED)
+
+# hiredis (Redis client)
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(HIREDIS hiredis)
+endif()
+if(NOT HIREDIS_FOUND)
+    find_library(HIREDIS_LIBRARIES hiredis)
+    find_path(HIREDIS_INCLUDE_DIRS hiredis/hiredis.h)
+endif()
+if(NOT HIREDIS_LIBRARIES)
+    message(FATAL_ERROR "hiredis not found. Install with: apt install libhiredis-dev")
+endif()
+
+# zlib for uWebSockets
+find_package(ZLIB REQUIRED)
+
 # uSockets — built as a static lib
 set(USOCKETS_DIR ${CMAKE_SOURCE_DIR}/third_party/uWebSockets/uSockets)
 file(GLOB USOCKETS_SRC ${USOCKETS_DIR}/src/*.c ${USOCKETS_DIR}/src/eventing/*.c ${USOCKETS_DIR}/src/crypto/*.c)
 
 add_library(uSockets STATIC ${USOCKETS_SRC})
 target_include_directories(uSockets PUBLIC ${USOCKETS_DIR}/src)
-target_compile_definitions(uSockets PUBLIC LIBUS_NO_SSL)  # No SSL — Traefik handles TLS
+target_compile_definitions(uSockets PUBLIC LIBUS_NO_SSL)
 
-# Find zlib for uWebSockets per-message deflate
-find_package(ZLIB REQUIRED)
-
-# uWebSockets — header-only, just need include path
+# uWebSockets include path
 set(UWS_INCLUDE ${CMAKE_SOURCE_DIR}/third_party/uWebSockets/src)
 
 # ── Main executable ──────────────────────────────────
@@ -57,11 +73,14 @@ add_executable(gameserver ${SOURCES})
 target_include_directories(gameserver PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${UWS_INCLUDE}
+    ${HIREDIS_INCLUDE_DIRS}
 )
 
 target_link_libraries(gameserver PRIVATE
     uSockets
     nlohmann_json::nlohmann_json
+    OpenSSL::Crypto
+    ${HIREDIS_LIBRARIES}
     ZLIB::ZLIB
     pthread
 )

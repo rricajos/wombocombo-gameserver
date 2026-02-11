@@ -6,7 +6,10 @@ RUN apk add --no-cache \
     cmake \
     git \
     zlib-dev \
-    linux-headers
+    linux-headers \
+    openssl-dev \
+    hiredis-dev \
+    pkgconf
 
 WORKDIR /src
 
@@ -30,7 +33,9 @@ FROM alpine:3.20
 RUN apk add --no-cache \
     libstdc++ \
     zlib \
-    curl
+    curl \
+    openssl \
+    hiredis
 
 COPY --from=build /src/build/gameserver /usr/local/bin/gameserver
 

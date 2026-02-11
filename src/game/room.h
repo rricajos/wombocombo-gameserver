@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include <functional>
 #include <optional>
 #include <nlohmann/json.hpp>
@@ -27,7 +28,7 @@ public:
 
     explicit Room(std::string id, int max_players = 4);
 
-    // Player management
+    // ── Player management ───────────────────────────
     bool add_player(const Player& player);
     void remove_player(const std::string& player_id);
     bool has_player(const std::string& player_id) const;
@@ -36,34 +37,53 @@ public:
     bool is_empty() const;
     int player_count() const;
 
-    // Lobby
+    // ── Lobby ───────────────────────────────────────
     void set_player_ready(const std::string& player_id, bool ready);
     bool all_ready() const;
 
-    // Chat
+    // ── Chat ────────────────────────────────────────
     void handle_chat(const std::string& sender_id, const std::string& message);
 
-    // Broadcasting — the Room doesn't own sockets; it calls this callback
-    // to send a message to a specific player. The server sets this up.
+    // ── Gameplay (Phase 2) ──────────────────────────
+    void start_game();
+    void update(float dt);                          // Called every tick
+    void queue_input(const std::string& player_id,
+                     int tick,
+                     const std::vector<std::string>& actions);
+
+    // ── Broadcasting ────────────────────────────────
     void set_broadcast_fn(BroadcastFn fn);
     void broadcast(const nlohmann::json& msg);
     void broadcast_except(const std::string& exclude_id, const nlohmann::json& msg);
     void send_to(const std::string& player_id, const nlohmann::json& msg);
 
-    // Accessors
+    // ── Accessors ───────────────────────────────────
     const std::string& id() const { return id_; }
     RoomState state() const { return state_; }
     int max_players() const { return max_players_; }
+    int current_tick() const { return tick_; }
 
-    // Build lobby state message
+    // ── State snapshots ─────────────────────────────
     nlohmann::json lobby_state() const;
+    nlohmann::json game_state() const;
 
 private:
     std::string id_;
     int max_players_;
     RoomState state_ = RoomState::WAITING;
+    int tick_ = 0;
+
     std::unordered_map<std::string, Player> players_;
     BroadcastFn broadcast_fn_;
+
+    // Spawn positions for up to 4 players
+    static constexpr float spawn_positions_[][2] = {
+        {200.0f, physics::GROUND_Y},
+        {400.0f, physics::GROUND_Y},
+        {600.0f, physics::GROUND_Y},
+        {800.0f, physics::GROUND_Y}
+    };
+    int next_spawn_ = 0;
 };
 
 } // namespace game

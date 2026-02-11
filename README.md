@@ -1,82 +1,86 @@
 # WomboCombo Game Server (C++)
 
-Real-time WebSocket game server for WomboCombo, a 2D cooperative survival platformer.
+Real-time WebSocket game server for WomboCombo — 2D cooperative survival platformer.
 
-## Phase 1 — Foundations
+## Phase 2 — Multiplayer Movement
 
-Current implementation:
-- [x] uWebSockets server accepting WebSocket connections
-- [x] Room system: create, join, leave
-- [x] Broadcast messages to all room members
-- [x] Chat messages in lobby
-- [x] Ready state tracking
-- [x] Health check endpoint (`/health`)
-- [x] Server info endpoint (`/info`)
-- [x] Dockerfile (multi-arch: amd64 + arm64)
-- [x] HTML test client
+- [x] **Phase 1**: WebSocket server, rooms, lobby, chat, broadcast
+- [x] **Phase 2**: Game loop at 20 ticks/s, player physics, game_state broadcast, JWT validation, Redis
+
+### What's new in Phase 2
+
+- **Game loop**: Global timer runs at 20 ticks/s, ticking all active rooms
+- **Player input → physics**: Clients send `player_input` with actions (`left`, `right`, `jump`), server updates position with gravity and ground collision
+- **game_state broadcast**: Every tick, all players receive positions of all other players
+- **JWT validation**: Tokens validated via HMAC-SHA256 using the secret from Redis (published by Go API)
+- **Redis integration**: Reads `jwt:secret`, writes `server:status`
+- **Countdown**: 5-second countdown before game starts when all players are ready
+
+### Game flow
+
+```
+1. Players join room (WAITING state)
+2. All players click READY
+3. Server starts 5s countdown (COUNTDOWN state)
+4. Server sends game_start with map_data and spawn_points
+5. Game loop begins (PLAYING state) — 20 ticks/s
+6. Clients send player_input → server updates physics → broadcasts game_state
+```
 
 ## Quick Start
 
-### Docker (recommended)
+### Docker
 
 ```bash
 docker build -t wombocombo-gameserver .
-docker run -p 9001:9001 wombocombo-gameserver
+docker run -p 9001:9001 \
+  -e REDIS_ADDR=redis:6379 \
+  -e REDIS_PASSWORD=secret \
+  wombocombo-gameserver
 ```
 
 ### Local Build
 
 ```bash
-# Clone uWebSockets
+# Dependencies (Alpine)
+apk add build-base cmake git zlib-dev openssl-dev hiredis-dev pkgconf
+
+# Dependencies (Ubuntu)
+apt install build-essential cmake git zlib1g-dev libssl-dev libhiredis-dev pkg-config
+
+# Build
 mkdir -p third_party
 git clone --depth 1 --recurse-submodules \
     https://github.com/uNetworking/uWebSockets.git third_party/uWebSockets
 
-# Build
 cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j$(nproc)
 
 # Run
-PORT=9001 LOG_LEVEL=debug ./build/gameserver
+REDIS_ADDR=localhost:6379 LOG_LEVEL=debug ./build/gameserver
 ```
-
-Or use the dev script:
-
-```bash
-chmod +x scripts/run_dev.sh
-./scripts/run_dev.sh          # normal
-./scripts/run_dev.sh --asan   # with AddressSanitizer
-./scripts/run_dev.sh --tsan   # with ThreadSanitizer
-```
-
-## Testing
-
-Open `tests/test_client.html` in two browser tabs, connect both to the same room, and send chat messages.
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `9001` | WebSocket server port |
+| `TICK_RATE` | `20` | Game loop ticks per second |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `MAX_ROOMS` | `100` | Maximum concurrent rooms |
 | `MAX_PLAYERS_PER_ROOM` | `4` | Max players per room |
-| `REDIS_ADDR` | `localhost:6379` | Redis address (Phase 2+) |
-| `REDIS_PASSWORD` | _(empty)_ | Redis password (Phase 2+) |
+| `REDIS_ADDR` | `localhost:6379` | Redis host:port |
+| `REDIS_PASSWORD` | _(empty)_ | Redis auth password |
 
-## Connection Flow
+## Architecture
 
 ```
-Client connects to:  ws://server:9001/ws?room=ROOM_ID&name=PLAYER_NAME
-
-1. Server validates room availability
-2. Generates a player ID (Phase 2: extracted from JWT)
-3. Creates room if it doesn't exist
-4. Sends "connected" to the new player
-5. Broadcasts "player_joined" to others
-6. Sends "lobby_state" to everyone
+Client (Svelte + Phaser) ←→ Traefik ←→ Game Server (C++ / uWebSockets)
+                                              ↓
+                                           Redis ← Go API (JWT secret)
 ```
 
-## Protocol (Phase 1)
-
-See `DEV2_GAMESERVER.md` for the full protocol spec.
+- Single-threaded event loop (uWebSockets)
+- One global timer ticks all active rooms
+- No threading needed — everything runs on the same loop
+- JWT secret cached at startup from Redis

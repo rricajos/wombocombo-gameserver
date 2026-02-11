@@ -17,6 +17,15 @@ if [ ! -d "${PROJECT_DIR}/third_party/uWebSockets" ]; then
         "${PROJECT_DIR}/third_party/uWebSockets"
 fi
 
+# Check dependencies
+echo "→ Checking dependencies..."
+for pkg in libhiredis-dev libssl-dev zlib1g-dev; do
+    if ! dpkg -s "$pkg" &>/dev/null 2>&1; then
+        echo "  Missing $pkg — installing..."
+        sudo apt-get install -y "$pkg"
+    fi
+done
+
 # CMake flags
 CMAKE_FLAGS="-DCMAKE_BUILD_TYPE=Debug"
 
@@ -38,5 +47,6 @@ export PORT="${PORT:-9001}"
 export LOG_LEVEL="${LOG_LEVEL:-debug}"
 export MAX_ROOMS="${MAX_ROOMS:-10}"
 export MAX_PLAYERS_PER_ROOM="${MAX_PLAYERS_PER_ROOM:-4}"
+export REDIS_ADDR="${REDIS_ADDR:-localhost:6379}"
 
 exec "${BUILD_DIR}/gameserver"

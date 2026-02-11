@@ -33,16 +33,20 @@ inline nlohmann::json make_error(int code, const std::string& message) {
 }
 
 // Build connected response
-inline nlohmann::json make_connected(const std::string& player_id, int server_tick) {
+inline nlohmann::json make_connected(const std::string& player_id,
+                                      const std::string& player_name,
+                                      int server_tick) {
     return {
         {"type", "connected"},
         {"player_id", player_id},
+        {"player_name", player_name},
         {"server_tick", server_tick}
     };
 }
 
 // Build player_joined event
-inline nlohmann::json make_player_joined(const std::string& player_id, const std::string& player_name) {
+inline nlohmann::json make_player_joined(const std::string& player_id,
+                                          const std::string& player_name) {
     return {
         {"type", "player_joined"},
         {"player_id", player_id},
